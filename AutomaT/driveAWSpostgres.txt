@@ -1,0 +1,240 @@
+import json
+import re
+import sqlalchemy as sqlache
+import psycopg2
+import boto3
+import warnings
+from pyresparser import ResumeParser
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+from pydrive2.files import FileNotUploadedError
+import pandas as pd
+import os
+import nltk
+# nltk.download('stopwords')
+import spacy
+spacy.load('en_core_web_sm')
+warnings.filterwarnings("ignore")
+
+
+# %%
+# session that connect to the S3 bucket
+session = boto3.Session(aws_access_key_id='',
+                        aws_secret_access_key='')
+s3 = session.resource('s3')
+bucket = s3.Bucket("cv-transformation")
+
+# engine to conect to the postgres DB which is hosted in AWS
+engine = sqlache.create_engine(
+    "")
+
+
+# %%
+# function to login into google drive
+# def login():
+#     """ Log in into a Drive account"""
+#     gauth = GoogleAuth()
+#     gauth.LocalWebserverAuth()
+#     return GoogleDrive(gauth)
+
+def login():
+    GoogleAuth.DEFAULT_SETTINGS['client_config_file'] = "credentials_module.json"
+    gauth = GoogleAuth()
+    gauth.LoadCredentialsFile("credentials_module.json")
+    if gauth.credentials is None:
+        gauth.LocalWebserverAuth(port_numbers=[8092])
+    elif gauth.access_token_expired:
+        gauth.Refresh()
+    else:
+        gauth.Authorize()
+    gauth.SaveCredentialsFile("credentials_module.json")
+    return GoogleDrive(gauth)
+
+
+drive = login()
+
+# %%
+folder_title = 'DevSavant / Hojas de Vida'
+folder_id = "1VGBV16A8DhtVzY-a1w_7UpyX6lB-fYKB"
+
+
+def PDF_DOCX_folderANDsubfolders(folder_title: str, folder_id: str) -> dict:
+    """Return in a dictionary all the files with mimeType equals to pdf o docx from a folder and its sub folders"""
+
+    str = "\'" + folder_id + "\'" + " in parents and trashed=false and (mimeType = 'application/pdf' or \
+                                      mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or \
+                                      mimeType = 'application/vnd.google-apps.folder')"
+    lista_archivos_target = drive.ListFile({'q': str}).GetList()
+    files_dict = {}
+    for sub_file in lista_archivos_target:
+        if sub_file["mimeType"] == "application/vnd.google-apps.folder":
+            str = "\'" + sub_file["id"] + "\'" + " in parents and trashed=false and (mimeType = 'application/pdf' or \
+                                      mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')"
+            sub_list = drive.ListFile({'q': str}).GetList()
+            for f in sub_list:
+                files_dict[f["id"]] = [f["title"], f["mimeType"],
+                                       sub_file["title"], f["createdDate"], f["modifiedDate"]]
+        else:
+            files_dict[sub_file["id"]] = [sub_file["title"], sub_file["mimeType"],
+                                          folder_title, sub_file["createdDate"], sub_file["modifiedDate"]]
+
+    return files_dict
+
+
+files_dict = PDF_DOCX_folderANDsubfolders(folder_title, folder_id)
+
+df = pd.DataFrame.from_dict(files_dict)
+
+df = df.transpose().reset_index()
+
+df.rename(columns={"index": "File_ID", 0: "Document_Title", 1: "Type_of_Document",
+          2: "Folder", 3: "Created_Date", 4: "Modified_Date"}, inplace=True)
+
+df.drop_duplicates("File_ID", inplace=True)
+# df
+
+# %%
+# compare if there is something new to add to the DB
+s1 = 'SELECT "File_ID" FROM "CVsMetadata"'
+result1 = engine.execute(s1)
+row = result1.fetchall()
+IDS_old_meta = [id[0] for id in row]
+
+ids_drive = df["File_ID"].tolist()
+
+if new_IDs_meta := [id for id in ids_drive if id not in IDS_old_meta]:
+    df = df[df["File_ID"].isin(new_IDs_meta)]
+    df.to_sql("CVsMetadata", con=engine, if_exists="append",
+              index=False, index_label="File_ID")
+    print("Info Succesfully added to SQL table")
+    # df
+else:
+    print("There is nothing to add")
+
+
+# %%
+print(f"new CVs to be added {len(new_IDs_meta)}")
+
+# %%
+# s2 = 'SELECT "File_ID" FROM "InfoCVs"; '
+# result2 = engine.execute(s2)
+# row = result2.fetchall()
+# IDs_old = [id[0] for id in row]
+
+# new_IDs = [id for id in ids_drive if id not in IDs_old]
+# len(new_IDs)
+
+# %%
+if new_IDs_meta:
+    print("adding information")
+    results = []
+    for id in new_IDs_meta:
+        # create the file
+        file = drive.CreateFile({"id": id})
+        local = file["title"]
+        # paths to S3 bucket
+        pathcvs = "cvs/" + file["title"]
+
+        file.GetContentFile(local)
+
+        # upload files to S3 bukets
+        bucket.upload_file(local, pathcvs)
+        # pass the CV to the model
+        parsed_info = ResumeParser(local).get_extracted_data()  # it is a dict
+        parsed_info["File_ID"] = file["id"]
+
+        results.append(parsed_info)
+
+        # remove file from local
+        os.remove(local)
+else:
+    print("There is nothing to add")
+
+
+# %%
+# define cleaning functions:
+
+def clean101(x):  # funcion para las columnas 'skills', 'degree', 'designation', 'experience', 'company_names'
+    x = x.replace("\'", "")
+    x = x.replace(", ,", "")
+    x = x.replace("|", "")
+    x = x.replace("''", "")
+    x = x.strip()
+    x = re.sub(r"_{2,}", "", x)
+    x = re.sub(r"\s{2,}", "", x)
+    return x
+# funciones para limpiar el nombre
+
+
+def cvstringclean1(x):
+
+    text = re.compile('CV - (.*)').search(x)
+    return 'None' if text is None else text[1]
+
+
+def cvstringclean2(x):
+    x = x.replace('_', ' ')
+    x = x.replace('CV ', '')
+    x = x.replace(' CV', '')
+    x = x.replace('CV', '')
+    x = x.replace('cv', '')
+    x = re.sub(r"\([^()]*\)", "", x)
+    x = x.lower().replace('resume', '')
+    x = x.lower().replace('resumé', '')
+    x = x.title()
+
+    return x
+
+
+def nulls(x):
+    x.replace("\x00", "\uFFFD")
+    return x
+
+
+# %%
+s3 = 'DELETE FROM "to_notion"'
+result3 = engine.execute(s3)
+try:
+    df_result = pd.DataFrame(results)
+
+    for col in ['name', 'mobile_number', 'skills', 'college_name', 'degree', 'designation', 'experience', 'company_names', 'total_experience']:
+        df_result[col] = df_result[col].astype(str).apply(nulls)
+        df_result[col] = df_result[col].apply(clean101)
+        df_result[col] = df_result[col].apply(cvstringclean2)
+
+    # df_result
+
+    df_result.to_sql("InfoCVs", con=engine, if_exists="append", index=False)
+    df_result.to_sql("InfoCVs_Backup", con=engine,
+                     if_exists="append", index=False)
+    df_result.to_sql("to_notion", con=engine, if_exists="append", index=False)
+except Exception as err:
+    print("There is nothing to add")
+
+
+# uploading an EXCEL file to google drive so TA has acces to
+s3 = pd.read_sql_query('''
+    SELECT *
+    FROM "CVsMetadata"
+    INNER JOIN "InfoCVs"
+    USING("File_ID");
+''', engine)
+
+df_toExcel = pd.DataFrame(s3)
+
+with pd.ExcelWriter("All_resumes.xlsx") as writer:
+    df_toExcel.to_excel(writer, index=False)
+
+# Deletes previos excel file so It does not replicate itself
+str = "\'" + "1zlUIZMBqCWg5pwo1K31Lj9K37IIrz8YM" + \
+    "\'" + " in parents and trashed=false"
+fileList_toDelete = drive.ListFile({'q': str}).GetList()
+for e in fileList_toDelete:
+    drive.CreateFile({'id': e['id']}).Trash()
+
+to_excel = drive.CreateFile(
+    {"parents": [{"id": "1zlUIZMBqCWg5pwo1K31Lj9K37IIrz8YM"}]})
+to_excel.SetContentFile("All_resumes.xlsx")
+to_excel.Upload()
+
+# os.remove("All_resumes.xlsx")
