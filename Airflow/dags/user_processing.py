@@ -1,5 +1,4 @@
-from cgitb import text
-import http
+import queue
 from airflow import DAG
 from datetime import datetime
 from airflow.providers.postgres.operators.postgres import PostgresOperator
@@ -40,9 +39,9 @@ def store_user():
     )
 
 
-# Creating "user_processing" dag, the catchup is set to false so it wont runn old DAGs
+# Creating "user_processing" dag, the catchup allows u to run old DAGs
 with DAG(dag_id="user_processing", start_date=datetime(2022, 10, 24),
-         schedule_interval='@daily', catchup=False) as dag:
+         schedule_interval='@daily', catchup=True) as dag:
 
     # Postgress operator which creates a new table if this not exist/// OPERATOR = ACTION
     create_table = PostgresOperator(
@@ -60,7 +59,8 @@ with DAG(dag_id="user_processing", start_date=datetime(2022, 10, 24),
                     email TEXT NOT NULL
 
                 );
-            """
+            """,
+        queue="high_cpu"
     )
 
     # HTTP operator to check if an api is available or not /// OPERATOR = SENSOR
