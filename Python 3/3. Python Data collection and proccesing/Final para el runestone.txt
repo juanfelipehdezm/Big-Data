@@ -1,0 +1,61 @@
+import requests_with_caching
+import json
+
+
+def get_movies_from_tastedive(movie_music_name):
+    base_url = "https://tastedive.com/api/similar"
+    param_as_dic = dict()
+    param_as_dic["q"] = movie_music_name
+    param_as_dic["type"] = "movies"
+    param_as_dic["limit"] = 5
+    reque = requests_with_caching.get(base_url , params = param_as_dic)
+    py_object = json.loads(reque.text)
+    
+    #to_string = json.dumps(py_object, indent = 4) por si quiero verlo organizado
+    return py_object
+
+
+def extract_movie_titles(movie_name):
+    list_of_movies = list()
+    for movie in movie_name['Similar']['Results']:
+        list_of_movies.append(movie["Name"])
+    return list_of_movies
+
+
+
+def get_related_titles(list_of_movies):
+    single_list = list()
+    for movie in list_of_movies:
+        movie_sugestions = get_movies_from_tastedive(movie)
+        names = extract_movie_titles(movie_sugestions) #tengo una lista por cada name
+        #print(names)
+        for name in names:
+            if name in single_list:continue
+            single_list.append(name)
+    return single_list
+
+
+def get_movie_data(movie_tittle):
+    base_url = "http://www.omdbapi.com/"
+    param_as_dic = dict()
+    param_as_dic["t"] = movie_tittle
+    param_as_dic["r"] = "json"
+    reque = requests_with_caching.get(base_url , params = param_as_dic)
+    py_object = json.loads(reque.text)
+    
+    #to_string = json.dumps(py_object, indent = 4) por si quiero verlo organizado
+    return py_object
+
+def get_movie_rating(info_of_movie):
+    value_rate = 0
+    ratings = info_of_movie["Ratings"]
+    for rate in ratings:
+        if rate["Source"] == "Rotten Tomatoes":
+            rotten_tomato = rate["Value"][:2]
+            value_rate =  int(rotten_tomato)
+    return value_rate
+    
+def get_sorted_recommendations(list_of_movies):
+    related_movies = get_related_titles(list_of_movies)
+    best_sort = sorted(related_movies,key = lambda x: (get_movie_rating(get_movie_data(x)),x),reverse = True)
+    return best_sort
